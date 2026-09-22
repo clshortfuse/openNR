@@ -1,0 +1,30 @@
+{
+  "version": 4,
+  "configurePresets": [
+    {
+      "name": "native",
+      "displayName": "OpenNR native tools (VS2022 x64)",
+      "generator": "Visual Studio 17 2022",
+      "architecture": "x64",
+      "binaryDir": "${sourceDir}/build/tools",
+      "cacheVariables": {
+        "BUILD_TESTING": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "native",
+      "configurePreset": "native",
+      "configuration": "Release"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "native",
+      "configurePreset": "native",
+      "configuration": "Release",
+      "output": { "outputOnFailure": true }
+    }
+  ]
+}

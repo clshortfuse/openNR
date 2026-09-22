@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "name": "compat-fp16",
+  "reference_output_sha256": "E67DEE209320CDAFE0E93E45675D7AA34323A53ACC57A72B2E40A181581C989A",
+  "build_available": true,
+  "input_manifest_sha256": "972C012CDD4F48458C1C93674B692872AFD306A198431A442B79271A8523DC50",
+  "base_filename": "bin/nvngx_dlssnr.dll",
+  "base_version": "310.8.0.0",
+  "base_size": 165840496,
+  "supported_upstream_sha256": [
+    "E16BCF15E16E13F527491CDF7845B2FE6521A738D8F7C9C721866A8496E1FC8E"
+  ],
+  "cuda_toolkit": {
+    "version": "13.3",
+    "compiler_version": "13.3.33",
+    "extractor_version": "13.3.29"
+  },
+  "ptx_version_observed": "9.3"
+}
