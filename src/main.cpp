@@ -64,6 +64,8 @@ int main(int argc, char** argv) {
     fs::path output;
     fs::path input;
     fs::path cuda;
+    fs::path cuda_extractor;
+    std::string profile_name = "compat-fp16-310.9.16";
     std::string command = "build";
     if (argc > 1) {
       command = argv[1];
@@ -82,6 +84,12 @@ int main(int argc, char** argv) {
         output = fs::absolute(argv[i + 1]);
       } else if (option == "--cuda-bin") {
         cuda = fs::absolute(argv[i + 1]);
+      } else if (option == "--cuobjdump-bin") {
+        cuda_extractor = fs::absolute(argv[i + 1]);
+      } else if (option == "--input") {
+        input = fs::absolute(argv[i + 1]);
+      } else if (option == "--profile") {
+        profile_name = argv[i + 1];
       } else {
         throw std::runtime_error("Unknown option " + option);
       }
@@ -89,16 +97,20 @@ int main(int argc, char** argv) {
     }
     if (command == "--help") {
       std::cout << "opennr [build|sources|extract] [--root DIR] [--output NEW_DIR] [--cuda-bin DIR]\n"
+                   "       [--cuobjdump-bin DIR] [--input DLL] [--profile compat-fp16-310.9.16|compat-fp16]\n"
                    "opennr [inspect|verify-base] [DLL] [--root DIR] [--output FILE]\n";
       return 0;
     }
     if (command != "build" && command != "verify-base" && command != "sources" && command != "inspect" && command != "extract") throw std::runtime_error("Unknown command");
-    const auto profile = Json::parse(Read(root / "profiles/compat-fp16.json"));
+    if (profile_name != "compat-fp16" && profile_name != "compat-fp16-310.9.16") throw std::runtime_error("Unknown profile");
+    const auto profile = Json::parse(Read(root / "profiles" / (profile_name + ".json")));
+    const bool relocated_fatbins = profile.value("relocated_fatbins", false);
     const auto& cuda_toolkit = profile.at("cuda_toolkit");
     if (cuda.empty()) {
       cuda = fs::path("C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA")
              / ("v" + cuda_toolkit.at("version").get<std::string>()) / "bin";
     }
+    if (cuda_extractor.empty()) cuda_extractor = cuda;
     const auto base_path = input.empty() ? root / profile.at("base_filename").get<std::string>() : input;
     auto base = Read(base_path);
     const auto inventory = InspectPe(base);
@@ -132,9 +144,24 @@ int main(int argc, char** argv) {
       std::cout << "Verified original DLL: " << inventory.sha256 << '\n';
       return 0;
     }
-    const auto recipe_bytes = Read(root / "profiles/compat-fp16-recipe.json");
+    const auto recipe_bytes = Read(root / profile.value("recipe", std::string("profiles/compat-fp16-recipe.json")));
     Check(recipe_bytes, profile.at("input_manifest_sha256"));
-    const auto recipe = Json::parse(recipe_bytes);
+    auto recipe = Json::parse(recipe_bytes);
+    if (relocated_fatbins) {
+      recipe["modules"] = Json::array();
+      for (const auto& row : recipe.at("module_rows")) {
+        if (row.size() != 7) throw std::runtime_error("Invalid module recipe row");
+        recipe["modules"].push_back({
+            {"index", recipe["modules"].size()},
+            {"offset", row.at(0)},
+            {"size", row.at(1)},
+            {"base_slot_sha256", row.at(2)},
+            {"elf120", {{"sha256", row.at(3)}}},
+            {"compile", Json::array({{{"sm", 75}, {"cubin_sha256", row.at(4)}}, {{"sm", 86}, {"cubin_sha256", row.at(5)}}})},
+            {"files", Json::array({{{"kind", "elf"}, {"sha256", row.at(6)}}})},
+        });
+      }
+    }
     const auto& data_section = RequireSinglePeSection(inventory, ".data");
     const auto discovered_fatbins = FindFatbins(base, data_section.offset, data_section.size);
     if (discovered_fatbins.size() != recipe.at("modules").size()) {
@@ -147,19 +174,19 @@ int main(int argc, char** argv) {
       }
     }
     if (output.empty()) {
-      output = root / (command == "extract" ? "build/original-native" : "build/compat-fp16");
+      output = root / "build" / (command == "extract" ? profile_name + "-original" : profile_name);
     }
     const auto requested_output = output;
     OutputTransaction output_transaction(requested_output);
     output = output_transaction.Working();
     for (const std::string tool : {"cuobjdump", "ptxas", "fatbinary"}) {
       const auto log = output / (tool + "-version.log");
-      Run(cuda / (tool + ".exe"), {L"--version"}, output, log);
+      Run((tool == "cuobjdump" ? cuda_extractor : cuda) / (tool + ".exe"), {L"--version"}, output, log);
       const auto version_key = tool == "cuobjdump" ? "extractor_version" : "compiler_version";
       const auto version = cuda_toolkit.at(version_key).get<std::string>();
       if (Read(log).find("V" + version) == std::string::npos) throw std::runtime_error("Unexpected " + tool + " version");
     }
-    Json report = {{"profile", "compat-fp16"}, {"implementation", "C++20"}, {"modules", Json::array()}};
+    Json report = {{"profile", profile_name}, {"implementation", "C++20"}, {"modules", Json::array()}};
     if (command == "extract") {
       Json manifest{{"schema", 1}, {"base_sha256", inventory.sha256}, {"modules", Json::array()}};
       for (size_t index = 0; index < discovered_fatbins.size(); ++index) {
@@ -170,7 +197,7 @@ int main(int argc, char** argv) {
         const auto fatbin = directory / "original.fatbin";
         Write(fatbin, fatbin_bytes);
         for (const std::string kind : {"ptx", "elf"}) {
-          Run(cuda / "cuobjdump.exe", {L"--extract-" + fs::path(kind).wstring(), L"all", fatbin.wstring()}, directory, directory / ("extract-" + kind + ".log"));
+          Run(cuda_extractor / "cuobjdump.exe", {L"--extract-" + fs::path(kind).wstring(), L"all", fatbin.wstring()}, directory, directory / ("extract-" + kind + ".log"));
         }
         fs::path ptx;
         fs::path cubin;
@@ -215,6 +242,14 @@ int main(int argc, char** argv) {
       return 0;
     }
     std::vector<std::tuple<size_t, std::string, std::string>> replacements;
+    std::string appended_fatbins;
+    struct RelocatedModule {
+      Json location;
+      size_t payload_offset;
+      size_t packed_size;
+      size_t original_size;
+    };
+    std::vector<RelocatedModule> relocated_modules;
     for (const auto& module : recipe.at("modules")) {
       const int index = module.at("index");
       const size_t offset = module.at("offset");
@@ -228,7 +263,7 @@ int main(int argc, char** argv) {
       const auto fatbin = original_directory / "original.fatbin";
       Write(fatbin, slot);
       for (const std::string kind : {"ptx", "elf"}) {
-        Run(cuda / "cuobjdump.exe", {L"--extract-" + fs::path(kind).wstring(), L"all", fatbin.wstring()}, original_directory, directory / ("extract-" + kind + ".log"));
+        Run(cuda_extractor / "cuobjdump.exe", {L"--extract-" + fs::path(kind).wstring(), L"all", fatbin.wstring()}, original_directory, directory / ("extract-" + kind + ".log"));
       }
       fs::path original_ptx;
       fs::path original_elf;
@@ -244,6 +279,7 @@ int main(int argc, char** argv) {
       }
       Check(Read(original_elf), module.at("elf120").at("sha256"));
       const auto original_text = Read(original_ptx);
+      const auto compatibility_text = relocated_fatbins ? StrengthenGpuAcquireFences(original_text) : original_text;
       std::vector<RegisterCapOverride> approximate_register_caps;
       for (const auto& register_cap : module.value("approximate_register_caps", Json::array())) {
         approximate_register_caps.push_back({
@@ -252,7 +288,7 @@ int main(int argc, char** argv) {
             .replacement = register_cap.at("replacement"),
         });
       }
-      const auto approximate = GenerateApproximatePtx(original_text, approximate_register_caps);
+      const auto approximate = GenerateApproximatePtx(compatibility_text, approximate_register_caps);
       Write(directory / "approximate.ptx", approximate);
       std::vector<std::wstring> images;
       for (const auto& source : module.at("compile")) {
@@ -265,18 +301,25 @@ int main(int argc, char** argv) {
               .replacement = register_cap.at("replacement"),
           });
         }
-        const auto generated = LowerApproximatePtx(approximate, sm, register_caps);
+        auto generated = LowerApproximatePtx(approximate, sm, register_caps);
+        if (relocated_fatbins) generated = internal::RewriteSinglePtxDirective(generated, "version", ".version 9.4");
         const auto ptx = directory / std::format("module.sm_{}.generated.ptx", sm);
         Write(ptx, generated);
         if (command == "sources") continue;
         const auto cubin = directory / std::format("module.sm_{}.cubin", sm);
         std::cout << "Compiling " << index << " SM" << sm << std::endl;
-        Run(cuda / "ptxas.exe", {L"--gpu-name", std::format(L"sm_{}", sm), L"--opt-level", L"3", L"--set-texmode-raw=true", L"--split-compile=0", L"--warn-on-spills", L"--verbose", L"--output-file", cubin.wstring(), ptx.wstring()}, directory, directory / std::format("sm_{}.log", sm));
+        if (relocated_fatbins) {
+          Run(cuda / "ptxas.exe", {std::format(L"-arch=sm_{}", sm), L"--set-texmode-raw=true", L"--split-compile=0", L"-o", cubin.wstring(), ptx.wstring()}, directory, directory / std::format("sm_{}.log", sm));
+        } else {
+          Run(cuda / "ptxas.exe", {L"--gpu-name", std::format(L"sm_{}", sm), L"--opt-level", L"3", L"--set-texmode-raw=true", L"--split-compile=0", L"--warn-on-spills", L"--verbose", L"--output-file", cubin.wstring(), ptx.wstring()}, directory, directory / std::format("sm_{}.log", sm));
+        }
         Check(Read(cubin), source.at("cubin_sha256"));
         images.insert(images.end(), {L"--image3", L"file=" + cubin.wstring() + L",kind=elf,sm=" + std::to_wstring(sm)});
       }
       const auto ada_ptx = directory / "module.sm_89.generated.ptx";
-      Write(ada_ptx, LowerOriginalPtxForAda(original_text));
+      auto ada_text = LowerOriginalPtxForAda(compatibility_text);
+      if (relocated_fatbins) ada_text = internal::RewriteSinglePtxDirective(ada_text, "version", ".version 9.4");
+      Write(ada_ptx, ada_text);
       if (command == "sources") {
         std::cout << "Generated source module " << index << std::endl;
         continue;
@@ -300,14 +343,49 @@ int main(int argc, char** argv) {
       images.push_back(L"--compress-all");
       Run(cuda / "fatbinary.exe", images, directory, directory / "fatbinary.log");
       auto bytes = Read(packed);
-      if (bytes.size() > size) throw std::runtime_error("Fatbin exceeds slot");
       report["modules"].push_back({{"index", index}, {"packed_size", bytes.size()}, {"sha256", Hash(bytes)}});
+      if (relocated_fatbins) {
+        const auto& locations = recipe.at("relocations");
+        const auto location = std::ranges::find_if(locations, [&](const Json& entry) { return entry.at("index").get<int>() == index; });
+        if (location != locations.end()) {
+          appended_fatbins.resize((appended_fatbins.size() + 15) & ~size_t(15), '\0');
+          relocated_modules.push_back({.location = *location, .payload_offset = appended_fatbins.size(), .packed_size = bytes.size(), .original_size = size});
+          appended_fatbins += bytes;
+          continue;
+        }
+      }
+      if (bytes.size() > size) throw std::runtime_error("Fatbin exceeds slot");
       bytes.resize(size, '\0');
       replacements.emplace_back(offset, slot, std::move(bytes));
     }
     if (command == "sources") {
       output_transaction.Commit();
       return 0;
+    }
+    if (relocated_fatbins) {
+      if (relocated_modules.size() != recipe.at("relocations").size()) throw std::runtime_error("Missing relocation modules");
+      const auto section = AppendFatbinSection(&base, appended_fatbins);
+      for (const auto& relocated : relocated_modules) {
+        const auto& location = relocated.location;
+        const auto offset = location.at("instruction_offset").get<size_t>();
+        const auto instruction_rva = location.at("instruction_rva").get<uint32_t>();
+        auto before = base.substr(offset, 7);
+        if (before.size() != 7 || before.substr(0, 3) != std::string("\x4c\x8d\x05", 3)
+            || int64_t(instruction_rva) + 7 + internal::ReadBinaryValue<int32_t>(before, 3, "RIP displacement") != location.at("original_rva").get<int64_t>()) {
+          throw std::runtime_error("Unexpected fatbin reference");
+        }
+        const auto displacement = int64_t(section.rva) + static_cast<int64_t>(relocated.payload_offset) - instruction_rva - 7;
+        if (displacement < INT32_MIN || displacement > INT32_MAX) throw std::runtime_error("Fatbin reference out of reach");
+        auto after = before;
+        const auto encoded = static_cast<int32_t>(displacement);
+        std::memcpy(after.data() + 3, &encoded, 4);
+        replacements.emplace_back(offset, before, after);
+        const auto old_size = static_cast<uint64_t>(relocated.original_size);
+        const auto new_size = static_cast<uint64_t>(relocated.packed_size);
+        replacements.emplace_back(location.at("size_offset").get<size_t>(),
+                                  std::string(reinterpret_cast<const char*>(&old_size), 8),
+                                  std::string(reinterpret_cast<const char*>(&new_size), 8));
+      }
     }
     for (const auto& patch : recipe.at("host_patches")) {
       const auto decode = [](const std::string& text) {

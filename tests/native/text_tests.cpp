@@ -230,6 +230,9 @@ int main() {
     }
     check(rejected, "Register cap crossed into the following PTX entry");
     check(internal::AddAcquireSemanticsToGpuReleaseFence("fence.release.gpu;") == "fence.acq_rel.gpu;", "GPU release fence did not gain acquire semantics");
+    check(StrengthenGpuAcquireFences("@%p1 fence.acquire.gpu;") == "@%p1 fence.acq_rel.gpu;", "Acquire fence lost its predicate");
+    check(StrengthenGpuAcquireFences("fence.acq_rel.gpu;") == "fence.acq_rel.gpu;", "Already lowered fence changed");
+    check(StrengthenGpuAcquireFences("fence.acquire.sys;") == "fence.acquire.sys;", "Acquire fence scope changed");
     check(internal::LowerBarrierWaitForAmpere("mbarrier.try_wait.shared::cta.b64 P_OUT, [%r1], %rd2;") == "mbarrier.test_wait.shared.b64 P_OUT, [%r1], %rd2;", "Barrier wait intent lowering failed");
     rejected = false;
     try {
@@ -254,6 +257,39 @@ int main() {
     pe_image.replace(0x200, 4, "test");
     const auto pe_inventory = InspectPe(pe_image);
     check(pe_inventory.sections.size() == 1 && pe_inventory.sections[0].name == ".data" && pe_inventory.sections[0].sha256 == Hash("test"), "PE section inventory mismatch");
+    // Upgrade the synthetic PE optional header to include security directory
+    // fields and reserve a second section header without moving raw data.
+    pe_image.replace(0xF0, 40, pe_image.substr(0xC8, 40));
+    pe_image.replace(0xC8, 40, std::string(40, '\0'));
+    write_pe_value(0x54, uint16_t{152});
+    write_pe_value(0x58 + 8, uint32_t{4});
+    write_pe_value(0x58 + 32, uint32_t{0x1000});
+    write_pe_value(0x58 + 36, uint32_t{0x200});
+    write_pe_value(0x58 + 56, uint32_t{0x2000});
+    write_pe_value(0x58 + 60, uint32_t{0x200});
+    write_pe_value(0x58 + 108, uint32_t{5});
+    write_pe_value(0xF0 + 8, uint32_t{4});
+    write_pe_value(0xF0 + 12, uint32_t{0x1000});
+    const auto original_pe = pe_image;
+    const auto appended = AppendFatbinSection(&pe_image, "new-fatbin");
+    check(appended.rva == 0x2000 && appended.offset == 0x400, "Wrong appended PE location");
+    check(pe_image.substr(0x200, 4) == "test" && pe_image.substr(appended.offset, 10) == "new-fatbin", "PE append changed payload bytes");
+    check(InspectPe(pe_image).sections.size() == 2 && pe_image.size() == 0x600, "Invalid appended section layout");
+    for (int invalid = 0; invalid < 5; ++invalid) {
+      pe_image = original_pe;
+      if (invalid == 0) pe_image[0x118] = 'X';
+      if (invalid == 1) write_pe_value(0x58 + 60, uint32_t{0x118});
+      if (invalid == 2) write_pe_value(0x58 + 36, uint32_t{3});
+      if (invalid == 3) write_pe_value(0x58 + 56, uint32_t{0x1000});
+      if (invalid == 4) write_pe_value(0x58 + 8, uint32_t{0xFFFFFFFF});
+      rejected = false;
+      try {
+        AppendFatbinSection(&pe_image, "new-fatbin");
+      } catch (const std::runtime_error&) {
+        rejected = true;
+      }
+      check(rejected, "Malformed PE append layout accepted");
+    }
     std::string fatbin(20, '\0');
     const auto write_fatbin_value = [&fatbin](size_t offset, const auto& value) { std::memcpy(fatbin.data() + offset, &value, sizeof(value)); };
     write_fatbin_value(0, uint32_t{0xBA55ED50});

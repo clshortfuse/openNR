@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "name": "compat-fp16-310.9.16",
+  "reference_output_sha256": "CDFA6C1EC784867182164C7836F324F087B5C9F374D0C9FE46F54999FEABF3ED",
+  "build_available": true,
+  "input_manifest_sha256": "BAA01D5BBAC645766537D5E8CC68F236DDDC48638F711AB662A998AE511B8CCE",
+  "recipe": "profiles/compat-fp16-310.9.16-recipe.json",
+  "base_filename": "bin/nvngx_dlssnr.310.9.16.dll",
+  "base_version": "310.9.16.0",
+  "base_size": 266424944,
+  "supported_upstream_sha256": ["2BC19BC09A7B89DD44F73E2AC0108FCC586E2154BDD0830F242F4F040E28789F"],
+  "cuda_toolkit": {"version": "13.4", "compiler_version": "13.4.92", "extractor_version": "13.4.92"},
+  "ptx_version_observed": "9.4",
+  "relocated_fatbins": true
+}

@@ -20,6 +20,12 @@ struct RegisterCapOverride {
   int replacement;
 };
 
+// Older architectures implement the acquire half through a stronger acq_rel
+// fence at the same GPU scope. Storage and synchronization scope are preserved.
+inline std::string StrengthenGpuAcquireFences(std::string_view ptx) {
+  return Replace(std::string(ptx), "fence.acquire.gpu;", "fence.acq_rel.gpu;");
+}
+
 namespace internal {
 
 inline std::string RewriteSinglePtxDirective(std::string_view ptx, std::string_view directive, std::string_view replacement) {

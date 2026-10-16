@@ -1,8 +1,10 @@
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <format>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -138,6 +140,76 @@ inline const PeSection& RequireSinglePeSection(const PeInventory& inventory, std
     throw std::runtime_error(std::format("Expected one {} section", name));
   }
   return *found;
+}
+
+struct AppendedPeSection {
+  uint32_t rva;
+  uint32_t offset;
+};
+
+// Append instead of shifting existing sections: imports, unwind data, resources,
+// and original relocation entries keep their existing addresses and offsets.
+inline AppendedPeSection AppendFatbinSection(std::string* image, std::string_view payload) {
+  InspectPe(*image);
+  const auto read32 = [&](size_t offset) {
+    return internal::ReadBinaryValue<uint32_t>(*image, offset, "PE append field");
+  };
+  const auto align = [](uint64_t value, uint32_t alignment) -> uint32_t {
+    if (alignment == 0 || (alignment & (alignment - 1)) != 0) throw std::runtime_error("Invalid PE alignment");
+    const auto result = (value + alignment - 1) & ~(uint64_t(alignment) - 1);
+    if (result > std::numeric_limits<uint32_t>::max()) throw std::runtime_error("PE append overflow");
+    return static_cast<uint32_t>(result);
+  };
+  const auto pe = read32(0x3C);
+  const auto optional = pe + 24;
+  const auto count = internal::ReadBinaryValue<uint16_t>(*image, pe + 6, "section count");
+  const auto optional_size = internal::ReadBinaryValue<uint16_t>(*image, pe + 20, "optional size");
+  if (optional_size < 152 || read32(optional + 108) < 5 || count == 0 || count == 0xFFFF || payload.empty()) {
+    throw std::runtime_error("Unsupported PE append layout");
+  }
+  const size_t table = optional + optional_size;
+  const size_t header = table + size_t(count) * 40;
+  if (header + 40 > read32(optional + 60) || header + 40 > image->size()
+      || image->substr(header, 40) != std::string(40, '\0')) {
+    throw std::runtime_error("No empty PE section header slot");
+  }
+  const auto section_alignment = read32(optional + 32);
+  const auto file_alignment = read32(optional + 36);
+  const auto raw = align(image->size(), file_alignment);
+  const auto rva = align(read32(optional + 56), section_alignment);
+  const auto raw_size = align(payload.size(), file_alignment);
+  const auto image_size = align(uint64_t(rva) + payload.size(), section_alignment);
+  const auto initialized_size = uint64_t(read32(optional + 8)) + raw_size;
+  if (initialized_size > std::numeric_limits<uint32_t>::max()
+      || uint64_t(raw) + raw_size > std::numeric_limits<uint32_t>::max()) throw std::runtime_error("PE append overflow");
+  for (size_t i = 0; i < count; ++i) {
+    const auto section = table + i * 40;
+    if (uint64_t(read32(section + 12)) + std::max(read32(section + 8), read32(section + 16)) > rva
+        || (read32(section + 16) != 0 && read32(section + 20) < header + 40)) {
+      throw std::runtime_error("New PE section overlaps existing data");
+    }
+  }
+  const auto write = [&](size_t offset, auto value) {
+    if (offset > image->size() || sizeof(value) > image->size() - offset) throw std::runtime_error("PE write outside image");
+    std::memcpy(image->data() + offset, &value, sizeof(value));
+  };
+  image->replace(header, 8, ".nrcubin");
+  write(header + 8, static_cast<uint32_t>(payload.size()));
+  write(header + 12, rva);
+  write(header + 16, raw_size);
+  write(header + 20, raw);
+  write(header + 36, uint32_t(0x40000040));
+  write(pe + 6, static_cast<uint16_t>(count + 1));
+  write(optional + 56, image_size);
+  write(optional + 8, static_cast<uint32_t>(initialized_size));
+  write(optional + 64, uint32_t(0));
+  // Modified bytes invalidate Authenticode. Keep overlay bytes but stop
+  // advertising the original certificate as a signature of this output.
+  write(optional + 144, uint64_t(0));
+  image->resize(raw, '\0');
+  image->append(payload);
+  image->resize(size_t(raw) + raw_size, '\0');
+  return {.rva = rva, .offset = raw};
 }
 
 }  // namespace opennr
